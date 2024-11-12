@@ -1,0 +1,780 @@
+---
+title: "Final exam - Data science for insurance"
+author: "Tanja Derin"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    df_print: paged
+    highlight: tango
+    theme: cerulean
+    toc: yes
+    toc_float:
+      collapsed: yes
+    number_sections: yes
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, cache = TRUE, warning = FALSE)
+```
+
+```{r, include=FALSE}
+library(copula)
+library(qrmtools) 
+library(xts)
+library(rugarch)
+library(zoo)
+library(qrmdata)
+library(tseries)
+library(forecast)
+```
+
+
+# Dataset
+
+**The data for the project can be an arbitrary dataset obtained from different sources (e.g. Yahoo Finance, R packages, Kaggle, etc) and should consist of a $d$-dimensional vector of risk factors (or risk factor changes), e.g, a set of $d$ time series of financial returns from a portfolio of assets or a vector of insurance losses.**
+
+For this project, I decided to use financial time series data from the S&P 500 constituents dataset, which includes daily adjusted close prices of companies listed in the S&P 500 index. 
+
+```{r}
+data("SP500_const")
+str(SP500_const)
+
+constituents <- colnames(SP500_const)
+print(constituents)
+```
+I select two specific continutiesin Apple (AAPL) and Microsoft (MSFT) in the period from 2007 to 2009, covering the Global Financial Crisis. Making it an interesting period to study the relationship between two influential tech stocks.   
+
+Log-returns are computed as the difference between the logarithm of consecutive prices.
+
+```{r}
+subset_data <- SP500_const["2007-01-01/2009-12-31", c("AAPL", "MSFT")]
+
+# Remove rows with NA values
+subset_data <- na.omit(subset_data)
+
+# Compute daily log-returns
+log_returns <- diff(log(subset_data))
+
+# Remove NA values resulting from log-return calculation
+log_returns <- na.omit(log_returns)
+
+# View the first few rows of the log-returns
+head(log_returns)
+num_data_points <- nrow(log_returns)
+num_data_points
+```
+## Visualize Log-Returns
+
+Fisrt we can plot the time series of Log-Returns to explore their volatility, correlations, and overall behavior during the financial crisis. 
+
+```{r}
+# Plot the time series of log-returns for AAPL and MSFT
+plot(log_returns$AAPL, type = "l", col = "royalblue", main = "Daily Log-Returns for AAPL and MSFT",
+     ylab = "Log-Returns", xlab = "Date", lwd = 1.5)
+lines(log_returns$MSFT, col = "black", lwd = 1.5)
+legend("topright", legend = c("AAPL", "MSFT"), col = c("royalblue", "black"), lty = 1, lwd = 1.5)
+grid()
+
+```
+The spikes in the log-returns suggest periods of higher market volatility. Both stocks exhibit sharp upward and downward movements, which might indicate events affecting the tech sector or the broader market during that period.
+
+We can also plot Histograms for AAPL and MSFT Log-Returns
+
+```{r}
+# Set up a layout to plot two histograms side by side
+par(mfrow = c(1, 2))
+
+# Plot histogram for AAPL log-returns
+hist(log_returns$AAPL, breaks = 50, col = "royalblue", main = "Histogram of AAPL",
+     xlab = "Log-Returns", border = "white")
+
+# Plot histogram for MSFT log-returns
+hist(log_returns$MSFT, breaks = 50, col = "black", main = "Histogram of MSFT",
+     xlab = "Log-Returns", border = "white")
+```
+
+```{r, include=FALSE}
+
+# Reset layout to default
+par(mfrow = c(1, 1))
+```
+
+The histograms show that the log-returns for both AAPL and MSFT have a bell-shaped distribution, with a peak around zero. This indicates that small changes in price are the most common. Both distributions seem to have heavier tails, which suggests the presence of extreme events or outliers.
+
+
+# Marginal modelling
+
+**assess whether the $d$ time series can be considered as a realization from a stationary multivariate time series: non-stationarity such as the presence of a trend can be detected to some extent by plotting the $d$ component series or performing Tests of Stationarity and/or stylized facts such as volatility clustering are present;**
+
+In this section, we assess whether the time series of log-returns for AAPL and MSFT exhibit stationarity or signs of volatility clustering
+
+The plot of the ACF of the log-returns will indicate if there is significant serial dependence in the returns themselves. For a stationary, independent time series, most autocorrelations should be close to zero.
+
+```{r}
+par(mfrow = c(1, 2))
+# Plot the ACF of AAPL log-returns
+acf(log_returns$AAPL, main = "ACF of AAPL Log-Returns")
+
+# Plot the ACF of MSFT log-returns
+acf(log_returns$MSFT, main = "ACF of MSFT Log-Returns")
+```
+The ACF plot for AAPL's log-returns shows a some spikes, suggesting some degree of short-term autocorrelation. However, the majority of lags fall within the confidence bounds. This indicates that while there might be some short-term dependencies, the overall time series is relatively independent.
+
+On the other hand the ACF plot for MSFT's log-returns shows more prominent spikes, with significant values just above the confidence bounds at lags 1, 2, and 3. This pattern suggests a more persistent short-term dependence in the log-returns of MSFT during this period. 
+
+```{r}
+# Perform the Ljung-Box test for AAPL
+ljung_box_aapl <- Box.test(log_returns$AAPL, lag = 10, type = "Ljung-Box")
+print(ljung_box_aapl)
+
+# Perform the Ljung-Box test for MSFT
+ljung_box_msft <- Box.test(log_returns$MSFT, lag = 10, type = "Ljung-Box")
+print(ljung_box_msft)
+
+```
+The Ljung-Box test results for the AAPL and MSFT log-returns show differing levels of autocorrelation. For AAPL, the p-value is relatively high, suggesting that there is no significant evidence of autocorrelation in the log-returns up to the chosen lag. This implies that the AAPL returns may be reasonably modeled as a stationary series without significant linear dependencies. 
+
+For MSFT log-returns the test indicates a low p-value, revealing significant autocorrelation within the data. This suggests that there are dependencies in the MSFT returns that need to be accounted for.
+
+It is beneficial to analyze the squared values to understand the dynamics of market volatility better.
+
+```{r}
+par(mfrow = c(1, 2))
+
+# Plot the ACF of squared AAPL log-returns
+acf(log_returns$AAPL^2, main = "ACF of Squared AAPL Log-Ret")
+
+# Plot the ACF of squared MSFT log-returns
+acf(log_returns$MSFT^2, main = "ACF of Squared MSFT Log-Ret")
+
+```
+
+The ACF plots of the squared log-returns for both AAPL and MSFT reveal a notable pattern. For both time series, the ACF shows significant spikes at lag 1 and several other lags. This indicates the presence of volatility clustering.
+
+
+```{r}
+# Perform the Ljung-Box test on the squared log-returns for AAPL
+ljung_box_squared_aapl <- Box.test(log_returns$AAPL^2, lag = 10, type = "Ljung-Box")
+print(ljung_box_squared_aapl)
+
+# Perform the Ljung-Box test on the squared log-returns for MSFT
+ljung_box_squared_msft <- Box.test(log_returns$MSFT^2, lag = 10, type = "Ljung-Box")
+print(ljung_box_squared_msft)
+
+```
+The Ljung-Box tests provide strong evidence of serial correlation in their variance. For both series, the test yields extremely low p-values, indicating that the null hypothesis of no autocorrelation is rejected.
+
+From the ACF plots of log-returns and squared log-returns, we conclude that while the returns themselves do not exhibit strong serial dependence indicating stationarity, both AAPL and MSFT show clear signs of volatility clustering, which justifies the use of GARCH models.
+
+
+## Model selection
+
+I used the The Partial Autocorrelation Function (PACF) to help determine the order of the AutoRegressive process. 
+
+```{r}
+par(mfrow = c(1, 2)) 
+
+# Plot the PACF of AAPL log-returns
+pacf(log_returns$AAPL, main = "PACF of AAPL Log-Returns")
+
+# Plot the PACF of MSFT log-returns
+pacf(log_returns$MSFT, main = "PACF of MSFT Log-Returns")
+
+```
+For AAPL, with little autocorrelation seen in the plots, the ARMA(0,1) model was chosen, as it only requires a moving average component. For MSFT, stronger autocorrelation was observed at lag 1, so the ARMA(1,1) model, which includes both autoregressive and moving average components, was selected.
+
+In this part I tried different GARCH orders and compare models using criteria like the Akaike Information Criterion (AIC) or Bayesian Information Criterion (BIC). 
+
+
+```{r, echo=FALSE}
+# Set up data for AAPL and MSFT
+data_list <- list(AAPL = log_returns$AAPL, MSFT = log_returns$MSFT)
+
+# Define combinations of (p, q) orders to try for sGARCH models
+arch_orders <- c(1, 2)  # Example ARCH orders
+garch_orders <- c(1, 2)  # Example GARCH orders
+
+# Loop through both AAPL and MSFT
+results <- list()
+
+for (ticker in names(data_list)) {
+  data <- data_list[[ticker]]
+  T <- length(data)  # Length of the time series
+  
+  # Adjust ARMA order based on ticker
+  if (ticker == "AAPL") {
+    arma_order <- c(0, 1)  # ARMA(0,1) for AAPL
+  } else if (ticker == "MSFT") {
+    arma_order <- c(1, 1)  # ARMA(1,1) for MSFT
+  }
+  
+  # Lists to store model results for each ticker
+  logL_values <- c()
+  numParams <- c()
+  aic_values <- c()
+  bic_values <- c()
+  model_names <- c()
+  model_list <- list()
+  
+  # Fit different sGARCH models with varying (p, q) orders
+  for (p in arch_orders) {
+    for (q in garch_orders) {
+      # Define the sGARCH model specification
+      spec <- ugarchspec(variance.model = list(model = "sGARCH", garchOrder = c(p, q)),
+                         mean.model = list(armaOrder = arma_order), 
+                         distribution.model = "std")
+      
+      # Fit the model within tryCatch to handle any errors
+      model <- tryCatch({
+        ugarchfit(spec = spec, data = data)
+      }, error = function(e) {
+        cat("Failed to fit sGARCH model with order (p, q):", p, q, "for", ticker, "\n")
+        return(NULL)
+      })
+      
+      # Proceed if the model fit was successful and contains valid information
+      if (!is.null(model) && !is.na(model@fit$LLH) && length(coef(model)) > 0) {
+        model_name <- paste("sGARCH(", p, ",", q, ")", sep = "")
+        model_names <- c(model_names, model_name)
+        model_list[[model_name]] <- model
+        
+        # Extract log-likelihood
+        logL <- model@fit$LLH
+        logL_values <- c(logL_values, logL)
+        
+        # Extract number of parameters (numParams)
+        num_params <- length(coef(model))
+        numParams <- c(numParams, num_params)
+        
+        # Calculate AIC and BIC manually
+        aic <- -2 * logL + 2 * num_params
+        bic <- -2 * logL + log(T) * num_params
+        
+        aic_values <- c(aic_values, aic)
+        bic_values <- c(bic_values, bic)
+        
+        cat(model_name, "- LogL:", logL, "NumParams:", num_params, 
+            "AIC:", aic, "BIC:", bic, "\n")
+      } else {
+        cat("Skipping sGARCH model with order (p, q):", p, q, "for", ticker, "due to fitting issues.\n")
+      }
+    }
+  }
+  
+  # Combine AIC and BIC values into a data frame for each ticker, if models were successfully fitted
+  if (length(model_names) > 0) {
+    comparison_table <- data.frame(Model = model_names, LogL = logL_values, NumParams = numParams, AIC = aic_values, BIC = bic_values)
+    results[[ticker]] <- list(comparison_table = comparison_table, models = model_list)
+    
+    # Print the comparison table
+    cat("\nModel Comparison for", ticker, ":\n")
+    print(comparison_table)
+    
+    # Identify the model with the lowest AIC and BIC
+    best_model_aic <- model_names[which.min(aic_values)]
+    best_model_bic <- model_names[which.min(bic_values)]
+    cat("Best sGARCH model for", ticker, "by AIC:", best_model_aic, "\n")
+    cat("Best sGARCH model for", ticker, "by BIC:", best_model_bic, "\n\n")
+  } else {
+    cat("No valid models were fitted for", ticker, "\n")
+  }
+}
+
+# Access the results for further analysis
+# Example: View the comparison table for AAPL
+results$AAPL$comparison_table
+# Example: View the best model for AAPL
+best_model_aapl <- results$AAPL$models[[results$AAPL$comparison_table[which.min(results$AAPL$comparison_table$AIC), "Model"]]]
+
+
+```
+The results from the model selection process for both AAPL and MSFT indicate that the sGARCH(1,1) model is the most suitable based on both the Akaike Information Criterion (AIC) and Bayesian Information Criterion (BIC). 
+
+This indicates that the simplest model with one ARCH and one GARCH term is sufficient to capture the conditional volatility structure in the data.
+
+## Fit an ARMA-GARCH Model
+
+Fit the chosen model for AAPL and MSFT separately:
+
+- For AAPL: ARMA(0,1)-GARCH(1,1) with Student-t distribution
+- For MSFT: ARMA(1,1)-GARCH(1,1) with Student-t distribution
+
+```{r}
+# Specify the ARMA(1,1)-GARCH(1,1) model for AAPL with Student-t distribution
+uspec_AAPL <- ugarchspec(variance.model = list(model = "sGARCH", garchOrder = c(1, 1)), 
+                         mean.model = list(armaOrder = c(0, 1)), 
+                         distribution.model = "std")  # Student-t innovations
+# Fit the model to AAPL log-returns
+garch_model_AAPL <- ugarchfit(spec = uspec_AAPL, data = log_returns$AAPL)
+```
+
+
+
+```{r}
+# Specify the ARMA(1,1)-GARCH(1,1) model for MSFT with Student-t distribution
+uspec_MSFT <- ugarchspec(variance.model = list(model = "sGARCH", garchOrder = c(1, 1)), 
+                         mean.model = list(armaOrder = c(1, 1)), 
+                         distribution.model = "std")  # Student-t innovations
+
+# Fit the model to MSFT log-returns
+garch_model_MSFT <- ugarchfit(spec = uspec_MSFT, data = log_returns$MSFT)
+```
+
+By specifying the models with Student-t distribution for both AAPL and MSFT, we’re accounting for both short-term dependencies in the returns and volatility clustering
+
+
+## Analyze Standardized Residuals
+
+**Next, the marginal models can be estimated with the function `ugarchfit()` and the estimated standardized residuals can be extrcted.**a
+
+The next step involves extracting the standardized residuals. These residuals are the series that result from the model after removing the fitted mean and accounting for the estimated volatility. 
+
+We can plot the ACF of the standardized residuals and their squares to ensure that the GARCH model has adequately captured the serial dependence and volatility clustering.
+
+
+```{r}
+# Extract standardized residuals for AAPL
+std_resid_AAPL <- residuals(garch_model_AAPL, standardize = TRUE)
+
+# Extract standardized residuals for MSFT
+std_resid_MSFT <- residuals(garch_model_MSFT, standardize = TRUE)
+
+# Plot ACF of standardized residuals
+par(mfrow = c(1, 2))
+
+# Plot the ACF of AAPL standardized residuals
+acf(std_resid_AAPL, main = "ACF of Standardized Res AAPL")
+
+# Plot the ACF of MSFT standardized residuals
+acf(std_resid_MSFT, main = "ACF of Standardized Res MSFT")
+```
+
+The ACF plots show that most of the autocorrelation values lie within the 95% confidence intervals. This indicates that there is no significant autocorrelation present in the standardized residuals, suggesting that the ARMA-GARCH model has adequately captured the serial dependencies in the log-returns of both AAPL and MSFT.
+
+We can also check the squared residuals.
+
+```{r}
+# Plot ACF of squared standardized residuals
+par(mfrow = c(1, 2))
+
+# Plot the ACF of squared AAPL standardized residuals
+acf(std_resid_AAPL^2, main = "ACF of Squared St Res AAPL")
+
+# Plot the ACF of squared MSFT standardized residuals
+acf(std_resid_MSFT^2, main = "ACF of Squared St Res MSFT")
+
+```
+
+The ACF of the squared residuals shows no significant autocorrelation, so the GARCH model has successfully captured the volatility clustering in the data. 
+
+# Dependence modelling
+
+We continue with the dependence modeling between the two time series. This involves using copula models to explore and model the joint behavior of the standardized residuals.
+
+The first step is to prepare the extracted residuals for the dependence modeling by transforming them in pseudo observations, which are the input for copula models.
+
+
+```{r}
+# Combine residuals into a matrix
+residuals_AAPL <- as.numeric(residuals(garch_model_AAPL, standardize = TRUE))
+residuals_MSFT <- as.numeric(residuals(garch_model_MSFT, standardize = TRUE))
+
+# Combine residuals into a matrix
+residuals_matrix <- cbind(residuals_AAPL, residuals_MSFT)
+
+# Create pseudo-observations (copula package expects a numeric matrix)
+U <- pobs(as.matrix(residuals_matrix))
+```
+
+
+## Measures of Association
+
+Spearman's Rank Correlation and Kendall's Tau are used to measure the association between the residuals.
+
+```{r}
+# Spearman's rank correlation
+spearman_corr <- cor(U, method = "spearman")
+
+# Kendall's Tau
+kendall_tau <- cor(U, method = "kendall")
+
+cat("Spearman's correlation:", spearman_corr, "\n")
+cat("Kendall's tau:", kendall_tau, "\n")
+```
+Both Spearman's correlation and Kendall's tau show a moderate positive association between the log-returns of AAPL and MSFT. This indicates that there is some level of dependence between the two stocks' returns.
+
+We can also assess tail dependence coefficients to help understan the likelihood that extreme movements in one asset are associated with extreme movements in the other.
+
+```{r}
+upper_quantile <- 0.95
+lower_quantile <- 0.05
+
+# Upper tail dependence: proportion of both U1 and U2 exceeding the upper quantile
+upper_tail <- mean(U[,1] > upper_quantile & U[,2] > upper_quantile)
+
+# Lower tail dependence: proportion of both U1 and U2 below the lower quantile
+lower_tail <- mean(U[,1] < lower_quantile & U[,2] < lower_quantile)
+
+cat("Estimated Lower Tail Dependence Coefficient:", lower_tail, "\n")
+cat("Estimated Upper Tail Dependence Coefficient:", upper_tail, "\n")
+
+```
+The results suggest very low tail dependence between AAPL and MSFT. This indicates that extreme negative or positive returns in one stock are not strongly associated with extreme returns in the other.
+
+
+## Graphical Diagnostics
+
+Plotting the pseudo-observations helps visually inspect the joint behavior, including symmetry, tail dependence, and clustering.
+
+```{r}
+# Scatter plot of pseudo-observations
+plot(U[,1], U[,2], main = "Scatter Plot of Pseudo-Observations",
+     xlab = "AAPL", ylab = "MSFT", pch = 20, col = 'blue')
+
+```
+
+
+A noticeable feature in the plot is the higher density of points in the lower-left corner, indicating weak tail dependence between extreme events.
+
+The plot also appears reasonably symmetric, suggesting that the relationship between AAPL and MSFT is balanced in both positive and negative extremes.
+
+This visual inspection reinforces the earlier findings, where low tail dependence coefficients indicated weak co-movement in extreme cases.
+
+To assess whether the copula exhibits exchangeable behavior we produce the test.
+
+```{r}
+# Test for exchangeability using exchTest from copula package
+set.seed(123)  # Ensure reproducibility
+exchangeability_test <- exchTest(U, N = 1000)
+print(exchangeability_test)
+
+```
+The p-value is 0.8477, which suggests that we cannot reject the null hypothesis of exchangeability.
+
+We can do the same for radial symmetry.
+
+```{r}
+# Test for radial symmetry using radSymTest from copula package
+set.seed(123)  # Ensure reproducibility
+radial_symmetry_test <- radSymTest(U, N = 1000)
+print(radial_symmetry_test)
+
+```
+In this case, the null hypothesis of radial symmetry is rejected, suggesting that the joint distribution of AAPL and MSFT does not exhibit radial symmetry. This implies potential asymmetry in the relationship, making asymmetric copulas worth considering.
+
+
+## Fit and Compare Models
+
+Based on the scatter plot and tail dependence analysis, we will fit several copula models. The Clayton copula will help model lower tail dependence, while the Frank copula provides a symmetric view of dependencies. Additionally, the Gaussian copula will serve as a baseline for linear dependence, and the t-copula will help capture joint tail behavior, providing a robust comparison across different dependence structures.
+
+#### Gaussian Copula
+
+```{r}
+gaussian_copula <- normalCopula(dim = 2, dispstr = "un")
+fit_gaussian <- fitCopula(gaussian_copula, U, method = "ml")
+
+# Summary of the fitted Gaussian copula
+summary(fit_gaussian)
+
+```
+The fitted Gaussian copula indicates a moderate positive correlation 0.4886 between the returns of AAPL and MSFT. The model converged successfully, and the standard error suggests that the correlation is estimated with good precision. 
+
+
+#### t-Copula
+
+```{r}
+t_copula <- tCopula(dim = 2, dispstr = "un")
+fit_t <- fitCopula(t_copula, U, method = "ml")
+
+# Summary of the fitted t-copula
+summary(fit_t)
+
+```
+
+The fitted t-copula also indicates a positive correlation of 0.52 with a relatively small standard error, suggesting a precise estimate of the correlation. The degrees of freedom are estimated at 4.56, indicating that the it accounts for potential tail dependence in the data
+
+#### Clayton copula
+
+```{r}
+clayton_copula <- claytonCopula(dim = 2)
+fit_clayton <- fitCopula(clayton_copula, U, method = "ml")
+
+# Summary of the fitted Clayton copula
+summary(fit_clayton)
+```
+
+#### Frank copula
+
+```{r}
+# Fit a Frank copula to the pseudo-observations
+frank_copula <- frankCopula(dim = 2)
+fit_frank <- fitCopula(frank_copula, U, method = "ml")
+
+# Summary of the fitted Frank copula
+summary(fit_frank)
+```
+
+### Compare models
+
+```{r, echo=FALSE}
+# Log-likelihoods, AIC, and BIC for comparison
+logL_gaussian <- logLik(fit_gaussian)
+aic_gaussian <- AIC(fit_gaussian)
+bic_gaussian <- BIC(fit_gaussian)
+
+logL_t <- logLik(fit_t)
+aic_t <- AIC(fit_t)
+bic_t <- BIC(fit_t)
+
+logL_clayton <- logLik(fit_clayton)
+aic_clayton <- AIC(fit_clayton)
+bic_clayton <- BIC(fit_clayton)
+
+logL_frank <- logLik(fit_frank)
+aic_frank <- AIC(fit_frank)
+bic_frank <- BIC(fit_frank)
+
+# Print comparison results in a single output block with additional formatting
+cat("Comparison of Copula Models:\n",
+    "-----------------------------------------\n",
+    "Gaussian Copula - LogL:", logL_gaussian, "AIC:", aic_gaussian, "BIC:", bic_gaussian, "\n",
+    "t-Copula - LogL:", logL_t, "AIC:", aic_t, "BIC:", bic_t, "\n",
+    "Clayton Copula - LogL:", logL_clayton, "AIC:", aic_clayton, "BIC:", bic_clayton, "\n",
+    "Frank Copula - LogL:", logL_frank, "AIC:", aic_frank, "BIC:", bic_frank, "\n",
+    "-----------------------------------------\n")
+
+```
+
+In summary, the t-copula is the preferred model based on the AIC and BIC criteria, likely due to its ability to model both symmetric and tail dependence, which seems to capture the dependence structure in the data more effectively than the other copulas considered.
+
+We can also use the `gofCopula()` function to perform goodness-of-fit tests for the chosen copulas using parametric bootstrapping. This will help us assess how well the selected copula model fits the data.
+
+
+```{r, include=FALSE}
+# Fix df for t-copula and perform goodness-of-fit test
+t_copula_fixed_df <- tCopula(df.fixed = TRUE, df = 4, dim = 2)
+fit_t_fixed_df <- fitCopula(t_copula_fixed_df, U, method = "ml")
+```
+
+
+```{r, cache=TRUE, warning=FALSE}
+# Goodness-of-Fit Test for the t-copula using "SnB" method
+gof_test_t_fixed_df <- gofCopula(fit_t_fixed_df@copula, U, N = 500, method = "SnB", estim.method = "ml", simulation = "pb")
+print(gof_test_t_fixed_df)
+
+# Goodness-of-Fit Test for the Gaussian copula
+gof_test_gaussian <- gofCopula(normalCopula(), U, N = 500, method = "SnB", estim.method = "ml", simulation = "pb")
+print(gof_test_gaussian)
+
+# Goodness-of-Fit Test for the Clayton copula
+gof_test_clayton <- gofCopula(claytonCopula(), U, N = 500, method = "SnB", estim.method = "ml", simulation = "pb")
+print(gof_test_clayton)
+
+# Goodness-of-Fit Test for the Frank copula
+gof_test_frank <- gofCopula(frankCopula(), U, N = 500, method = "SnB", estim.method = "ml", simulation = "pb")
+print(gof_test_frank)
+
+```
+The goodness-of-fit test evaluates how well the selected copula models fit the observed data by comparing the simulated copula samples to the empirical copula of the data. 
+
+Overall, the t-copula appears to be the most suitable model among those tested, as its high p-value indicates no strong evidence against its fit. In contrast, the normal, Clayton, and Frank copulas showed lower p-values.
+
+In the next step the Rosenblatt transformation was applied to the pseudo-observations generated from the fitted t-copula model.
+
+```{r}
+# Rosenblatt transformation for the fitted t-copula
+rosenblatt_transformed <- pobs(rCopula(755, fit_t@copula))
+pairs(rosenblatt_transformed, main = "Pairwise Rosenblatt Transformations")
+
+```
+
+In the plot, there is some concentration of points in certain areas, suggesting that the t-copula might not perfectly capture all aspects of the dependency structure between the variables since ideally, if the copula model fits well, these scatter plots should show a uniform distribution of points.
+
+
+# Simulation and Risk estimation
+
+## Simulation
+
+**Simulate a large number of paths (say R=1000) of size 260 (roughly the number of trading days in 1 year) from the fitted model (e.g. the copula-GARCH time-series model estimated before).  *Hint*: first simulate the $d$ series of log-returns under the selected model, then obtain predicted prices for each stock by using the inverse transformation (see the `returns()` function in **qrmtools**)**
+
+Trading days per year
+
+```{r}
+# Calculate the total number of trading days in each year
+trading_days_per_year <- table(format(index(log_returns), "%Y"))
+average_trading_days <- mean(trading_days_per_year)
+cat("Average trading days per year:", average_trading_days, "\n")
+
+```
+We can simulate the daily log-returns for both AAPL and MSFT using the fitted ARMA-GARCH models for nearly one year across R = 1000 simulation paths.
+
+```{r}
+R <- 1000
+n_days <- average_trading_days
+
+# Fit GARCH models for AAPL and MSFT
+uspec_AAPL <- ugarchspec(variance.model = list(model = "sGARCH", garchOrder = c(1, 1)), 
+                         mean.model = list(armaOrder = c(0, 1)), 
+                         distribution.model = "std")  # Student-t distribution
+
+uspec_MSFT <- ugarchspec(variance.model = list(model = "sGARCH", garchOrder = c(1, 1)), 
+                         mean.model = list(armaOrder = c(1, 1)), 
+                         distribution.model = "std")  # Student-t distribution
+
+# Fit models
+garch_model_AAPL <- ugarchfit(spec = uspec_AAPL, data = log_returns$AAPL)
+garch_model_MSFT <- ugarchfit(spec = uspec_MSFT, data = log_returns$MSFT)
+
+# Simulate log-returns from the GARCH models
+sim_AAPL <- ugarchsim(garch_model_AAPL, n.sim = n_days, m.sim = R)
+sim_MSFT <- ugarchsim(garch_model_MSFT, n.sim = n_days, m.sim = R)
+
+# Extract simulated log-returns
+sim_log_returns_AAPL <- fitted(sim_AAPL)
+sim_log_returns_MSFT <- fitted(sim_MSFT)
+
+```
+
+Here, we are generating 1000 different possible paths that represent potential scenarios for the price movements of AAPL and MSFT.
+
+Now, we simulate from the copula to create dependency between the simulated log-returns of AAPL and MSFT.
+
+```{r, include=FALSE}
+library(copula)
+library(mvtnorm)  # Used by copula for t-copula simulation
+library(rugarch)   # For GARCH modeling
+
+# Fit t-copula (if not already done earlier)
+t_copula <- tCopula(dim = 2, df.fixed = TRUE)
+fit_t <- fitCopula(t_copula, U, method = "ml")
+```
+
+
+```{r}
+# Use the fitted copula model (e.g., t-copula) to simulate the dependency structure
+U_sim <- rCopula(R, fit_t@copula)
+U_sim_AAPL <- matrix(U_sim[, 1], nrow = n_days, ncol = R)
+U_sim_MSFT <- matrix(U_sim[, 2], nrow = n_days, ncol = R)
+
+# Apply the copula samples to simulate the final log-returns with dependency
+sim_log_returns_AAPL <- qnorm(U_sim_AAPL) * sigma(sim_AAPL) + fitted(sim_AAPL)
+sim_log_returns_MSFT <- qnorm(U_sim_MSFT) * sigma(sim_MSFT) + fitted(sim_MSFT)
+
+```
+
+We convert the simulated log-returns to predicted prices using the returns() function from the qrmtools package.
+
+```{r}
+# Assume initial prices for AAPL and MSFT
+initial_price_AAPL <- subset_data$AAPL[1]
+initial_price_MSFT <- subset_data$MSFT[1]
+
+# Create a vector of initial prices matching the number of simulation paths
+initial_prices_AAPL <- rep(initial_price_AAPL, ncol(sim_log_returns_AAPL))
+initial_prices_MSFT <- rep(initial_price_MSFT, ncol(sim_log_returns_MSFT))
+
+# Convert simulated log-returns to prices using the returns() function from qrmtools
+simulated_prices_AAPL <- returns(sim_log_returns_AAPL, method = "logarithmic", inverse = TRUE, start = initial_prices_AAPL)
+simulated_prices_MSFT <- returns(sim_log_returns_MSFT, method = "logarithmic", inverse = TRUE, start = initial_prices_MSFT)
+
+# Check the dimensions of the simulated prices
+cat("Simulated AAPL prices dimensions:", dim(simulated_prices_AAPL), "\n")
+cat("Simulated MSFT prices dimensions:", dim(simulated_prices_MSFT), "\n")
+
+
+```
+## Risk estimation
+
+**Estimate risk measures for the equally weighted portfolio by comparing: (1) the empirical $VaR_{\alpha}$ of the portfolio without any parametric assumption based on the available losses (2) the estimate with the same historical marginal distributions but with a  comonotone assumption (theoretically, this is the sum of each individual VaRs) and an independence assumption as dependence structure.**
+
+First we have to calculate the empirical $VaR_{\alpha}$ of the portfolio without any dependence assumption.
+
+```{r}
+# Combine log-returns for AAPL and MSFT
+log_returns_combined <- log_returns[, c("AAPL", "MSFT")]
+
+# Equally weighted portfolio: compute the portfolio returns
+portfolio_returns <- rowMeans(log_returns_combined)
+
+# Calculate the empirical losses (negative portfolio returns)
+portfolio_losses <- -portfolio_returns
+
+# Set the confidence level for VaR (e.g., 95%)
+alpha <- 0.95
+
+# Calculate the empirical VaR for the portfolio
+empirical_VaR <- quantile(portfolio_losses, probs = alpha)
+cat("Empirical VaR at confidence level", alpha, ":", empirical_VaR, "\n")
+
+```
+This means that we expect in 95% of the trading days, the portfolio will not lose more than 3.89% of its value. This empirical VaR is a useful measure because it does not assume any parametric model for the data.
+
+Now we estimate with comonotone assumption, this involves adding the individual 
+$VaR_{\alpha}$ of each asset to find the portfolio's VaR, assuming perfect positive correlation.
+
+```{r}
+# Calculate individual VaRs for AAPL and MSFT
+VaR_AAPL <- quantile(-log_returns$AAPL, probs = alpha)
+VaR_MSFT <- quantile(-log_returns$MSFT, probs = alpha)
+
+# Comonotone VaR: sum of individual VaRs
+comonotone_VaR <- VaR_AAPL + VaR_MSFT
+cat("Comonotone VaR at confidence level", alpha, ":", comonotone_VaR, "\n")
+
+```
+Under this assumption, the potential losses of the portfolio are higher compared to the empirical VaR because this model considers the worst-case scenario where both assets experience their maximum losses simultaneously.
+
+
+And now for the independence assumption, we assume the portfolio’s losses are a sum of independent random variables. So we 
+- Simulate independent losses for AAPL and MSFT.
+- Construct the portfolio loss from the simulated values.
+
+```{r}
+# Number of simulations
+R <- 1000
+
+# Simulate independent losses using the historical distributions of AAPL and MSFT
+sim_losses_AAPL <- sample(-log_returns$AAPL, R, replace = TRUE)
+sim_losses_MSFT <- sample(-log_returns$MSFT, R, replace = TRUE)
+
+# Construct portfolio losses assuming independence (equally weighted)
+sim_portfolio_losses_independent <- 0.5 * (sim_losses_AAPL + sim_losses_MSFT)
+
+# Calculate VaR for the independent portfolio losses
+independent_VaR <- quantile(sim_portfolio_losses_independent, probs = alpha)
+cat("Independent VaR at confidence level", alpha, ":", independent_VaR, "\n")
+
+```
+This VaR estimate is very close to the empirical VaR (3.89%), which suggests that assuming independence between the two stocks yields a similar risk level as observed historically.
+
+
+## Comparison
+
+**Compare the estimates of VaR of predicted aggregated loss from (ii) with the $VaR_{\alpha}$ under the assumption of the selected copula-GARCH time-series model (use a Monte-Carlo simulation with 1000 replications).**
+
+
+```{r}
+# Compute portfolio returns from simulated prices
+sim_portfolio_prices <- 0.5 * (simulated_prices_AAPL + simulated_prices_MSFT)
+
+# Compute portfolio returns (log-returns of simulated prices)
+sim_portfolio_returns <- diff(log(sim_portfolio_prices), lag = 1)
+
+# Compute portfolio losses as negative returns
+sim_portfolio_losses <- -sim_portfolio_returns
+
+# Estimate VaR at 95% confidence level using simulated portfolio losses
+alpha <- 0.95
+copula_garch_VaR <- apply(sim_portfolio_losses, 2, function(x) quantile(x, probs = alpha))
+
+# Get VaR from the simulated results
+final_copula_garch_VaR <- quantile(copula_garch_VaR, probs = alpha)
+
+# Compare with empirical, comonotone, and independent VaR estimates
+cat("Empirical VaR:", empirical_VaR, "\n")
+cat("Comonotone VaR:", comonotone_VaR, "\n")
+cat("Independent VaR:", independent_VaR, "\n")
+cat("Copula-GARCH VaR:", final_copula_garch_VaR, "\n")
+
+```
+The VaR derived from the Copula-GARCH model is the highest at 0.0842. This reflects the model’s ability to capture more complex dependence structures and volatility clustering in the time series.
